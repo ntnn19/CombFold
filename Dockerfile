@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     make \
     g++ \
     libboost-all-dev \
+    parallel \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir biopython==1.84 py3Dmol scipy numpy
