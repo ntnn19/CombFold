@@ -323,7 +323,7 @@ def extract_transformations(pdb_path_to_partial_subunits: Dict[str, List[Partial
 
 
 def run_on_pdbs_folder(subunits_json_path: str, pdbs_folder: str, output_path: str,
-                       crosslinks_path: Optional[str] = None, output_cif: bool = False, max_results_number: int = 5):
+                       crosslinks_path: Optional[str] = None, output_cif: bool = True, max_results_number: int = 5):
     pdbs_folder = os.path.abspath(pdbs_folder)
     output_path = os.path.abspath(output_path)
 
