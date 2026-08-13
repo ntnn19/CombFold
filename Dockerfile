@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN pip install --no-cache-dir biopython==1.84 py3Dmol scipy numpy
 
-RUN wget -qnc -O CombFold-master.zip https://github.com/dina-lab3D/CombFold/archive/refs/heads/master.zip && \
+RUN wget -qnc -O CombFold-master.zip https://github.com/ntnn19/CombFold/archive/refs/heads/master.zip && \
     unzip -q CombFold-master.zip && \
     echo "Downloaded CombFold, Installing" && \
     cd CombFold-master/CombinatorialAssembler && \
