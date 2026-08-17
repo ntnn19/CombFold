@@ -1,3 +1,4 @@
+  GNU nano 7.2                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       prepare_fastas_parallel.py                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
 import argparse
 import os
 from collections import defaultdict
@@ -6,6 +7,8 @@ import Bio.PDB
 import Bio.SeqUtils
 import numpy as np
 import scipy.spatial.distance
+import multiprocessing as mp
+from functools import partial
 
 from libs.utils_classes import SubunitsInfo, SubunitName, read_subunits_info, INTERFACE_MIN_ATOM_DIST
 
@@ -70,20 +73,27 @@ def get_job_length(subunit_names, subunits_info):
     return sum([len(subunits_info[subunit_name].sequence) for subunit_name in subunit_names])
 
 
-def get_fastas_for_groups(subunits_info: SubunitsInfo, output_folder: str, max_af_size: int, pairs_folder: str):
+def get_fastas_for_groups(subunits_info: SubunitsInfo, output_folder: str, max_af_size: int,
+                           pairs_folder: str, num_workers: Optional[int] = None):
     groups_jobs = set()
 
     names_by_sequences = {s.sequence: s.name for s in subunits_info.values()}
 
     best_for_subunit: Dict[SubunitName, Dict[SubunitName, float]] = defaultdict(dict)
     pairs_to_use = [os.path.join(pairs_folder, i) for i in os.listdir(pairs_folder) if i.endswith(".pdb")]
-    for pair_path in pairs_to_use:
-        score_result = score_pdb_pair(pair_path, names_by_sequences)
-        if score_result is None:
-            continue
-        (subunit1, subunit2), score = score_result
-        best_for_subunit[subunit1][subunit2] = max(best_for_subunit[subunit1].get(subunit2, 0), score)
-        best_for_subunit[subunit2][subunit1] = max(best_for_subunit[subunit2].get(subunit1, 0), score)
+
+    num_workers = num_workers or os.cpu_count()
+    score_fn = partial(score_pdb_pair, names_by_sequences=names_by_sequences)
+
+    with mp.Pool(processes=num_workers) as pool:
+        # chunksize > 1 cuts IPC overhead when there are many small pdb files
+        results = pool.imap_unordered(score_fn, pairs_to_use, chunksize=max(1, len(pairs_to_use) // (num_workers * 4)))
+        for score_result in results:
+            if score_result is None:
+                continue
+            (subunit1, subunit2), score = score_result
+            best_for_subunit[subunit1][subunit2] = max(best_for_subunit[subunit1].get(subunit2, 0), score)
+            best_for_subunit[subunit2][subunit1] = max(best_for_subunit[subunit2].get(subunit1, 0), score)
 
     for subunit_name, subunit_info in subunits_info.items():
         sorted_best_for_subunit = sorted(best_for_subunit[subunit_name].keys(),
@@ -123,6 +133,7 @@ def main():
     parser.add_argument("--output-fasta-folder", type=str)
     parser.add_argument("--max-af-size", type=int, default=1800)
     parser.add_argument("--input-pairs-results", type=str, default="")
+    parser.add_argument("--workers", type=int, default=None, help="Number of parallel processes (default: CPU count)")
     args = parser.parse_args()
 
     subunits_info = read_subunits_info(args.subunits_json)
@@ -137,7 +148,7 @@ def main():
     elif args.stage == "groups":
         assert args.input_pairs_results != "" and os.path.isdir(args.input_pairs_results), \
             "When running stage=groups, must supply pairs results folder with --input-pairs-results"
-        get_fastas_for_groups(subunits_info, args.output_fasta_folder, args.max_af_size, args.input_pairs_results)
+        get_fastas_for_groups(subunits_info, args.output_fasta_folder, args.max_af_size, args.input_pairs_results, args.workers)
 
 
 if __name__ == "__main__":
