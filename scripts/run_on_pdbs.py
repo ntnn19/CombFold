@@ -31,9 +31,10 @@ class PartialSubunit:
     subunit_name: str
     pdb_path: str
     chain_id: str
-    start_residue_id: int
-    end_residue_id: int
+    start_residue_id: int  # inclusive
+    end_residue_id: int  # inclusive
     subunit_start_sequence_id: int
+    is_complete: bool = False
 
 
 @dataclasses.dataclass
@@ -44,6 +45,28 @@ class TransformationInfo:
     rep_imposed_rmsds: Tuple[float, float]
     transformation_numbers: str
     score: float
+
+
+def get_chain_to_seq(pdb_path: str, use_seqres: bool = True) -> Dict[str, str]:
+    if use_seqres:
+        chain_to_seq = {str(record.id): str(record.seq) for record in Bio.SeqIO.parse(pdb_path, 'pdb-seqres')}
+        if len(chain_to_seq) > 0:
+            return chain_to_seq
+
+    model = get_pdb_model_readonly(pdb_path)
+    chain_to_seq = {}
+    for chain in model.get_chains():
+        res_id_to_res = {res.get_id()[1]: res for res in chain.get_residues() if "CA" in res}
+        if len(res_id_to_res) == 0:
+            print("skipping empty chain", chain.get_id())
+            continue
+        chain_to_seq[chain.get_id()] = ""
+        for i in range(1, max(res_id_to_res) + 1):
+            if i in res_id_to_res:
+                chain_to_seq[chain.get_id()] += Bio.SeqUtils.seq1(res_id_to_res[i].get_resname())
+            else:
+                chain_to_seq[chain.get_id()] += "X"
+    return chain_to_seq
 
 
 def _get_partial_subunit_residues(partial_subunit: PartialSubunit) -> List[Bio.PDB.Residue.Residue]:
@@ -64,6 +87,7 @@ def extract_partial_subunit(partial_subunit: PartialSubunit, output_path: str):
             model.detach_child(chain.id)
 
     res_to_keep = _get_partial_subunit_residues(partial_subunit)
+
     res_to_remove = [res for res in model.get_residues() if res not in res_to_keep]
     for res in res_to_remove:
         res.parent.detach_child(res.id)
@@ -170,73 +194,77 @@ def get_pdb_to_partial_subunits(pdbs_folder: str, subunits_info: SubunitsInfo) -
         if not pdb_filename.endswith(".pdb"):
             continue
         pdb_path = os.path.join(pdbs_folder, pdb_filename)
-        pdb_model = get_pdb_model_readonly(pdb_path)
 
         partial_subunits: List[PartialSubunit] = []
-        chains = list(pdb_model.get_chains())
-        for chain in chains:
-            chain_seq = ""
-            chain_seq_index_to_residue_id = {}
-            for res in chain.get_residues():
-                if Bio.SeqUtils.seq1(res.get_resname()) == "X":
-                    continue
-                chain_seq += Bio.SeqUtils.seq1(res.get_resname())
-                chain_seq_index_to_residue_id[len(chain_seq) - 1] = res.get_id()[1]
-
+        chain_to_seq = get_chain_to_seq(pdb_path, use_seqres=False)
+        for chain_id, chain_seq in chain_to_seq.items():
             for subunit_info in subunits_info.values():
-                subunit_seq = "".join([i for i in subunit_info.sequence if i != "X"])
+                subunit_seq = subunit_info.sequence
                 if subunit_seq in chain_seq:
-                    print(f"found full {subunit_info.name} in {pdb_filename} chain {chain.get_id()}")
-                    start_res_id = chain_seq_index_to_residue_id[chain_seq.index(subunit_seq)]
+                    print(f"found full {subunit_info.name} in {pdb_filename} chain {chain_id}")
+                    start_res_id = chain_seq.index(subunit_seq) + 1
                     end_res_id = start_res_id + len(subunit_seq) - 1
                     partial_subunits.append(PartialSubunit(subunit_name=subunit_info.name,
                                                            pdb_path=pdb_path,
-                                                           chain_id=chain.get_id(),
+                                                           chain_id=chain_id,
                                                            start_residue_id=start_res_id,
                                                            end_residue_id=end_res_id,
-                                                           subunit_start_sequence_id=0))
+                                                           subunit_start_sequence_id=0,
+                                                           is_complete=True)
+                                            )
                 elif chain_seq in subunit_seq:
-                    start_residue_id = min(chain_seq_index_to_residue_id.values())
-                    end_residue_id = max(chain_seq_index_to_residue_id.values())
-                    print(f"found partial {subunit_info.name} in {pdb_filename} chain {chain.get_id()}"
+                    start_residue_id = 1
+                    end_residue_id = len(chain_seq)
+                    print(f"found partial {subunit_info.name} in {pdb_filename} chain {chain_id}"
                           f"{(end_residue_id - start_residue_id + 1)}/{len(subunit_seq)}")
                     partial_subunits.append(PartialSubunit(subunit_name=subunit_info.name,
                                                            pdb_path=pdb_path,
-                                                           chain_id=chain.get_id(),
+                                                           chain_id=chain_id,
                                                            start_residue_id=start_residue_id,
                                                            end_residue_id=end_residue_id,
-                                                           subunit_start_sequence_id=subunit_seq.index(chain_seq)))
+                                                           subunit_start_sequence_id=subunit_seq.index(chain_seq),
+                                                           is_complete=False)
+                                            )
                 else:
-                    # check if part of subunit is in start/end of the chain (to catch small overlaps)
-                    if subunit_seq[:10] in chain_seq:
-                        start_of_subunit_in_chain = chain_seq.index(subunit_seq[:10])
-                        if subunit_seq.startswith(chain_seq[start_of_subunit_in_chain:]):
-                            start_res_id = chain_seq_index_to_residue_id[start_of_subunit_in_chain]
-                            end_res_id = max(chain_seq_index_to_residue_id.values())
-                            print(f"found partial {subunit_info.name} in {pdb_filename} chain {chain.get_id()} "
-                                  f"starting at index {start_of_subunit_in_chain} "
-                                  f"{(end_res_id - start_res_id + 1)}/{len(subunit_seq)}")
-                            partial_subunits.append(PartialSubunit(subunit_name=subunit_info.name,
-                                                                   pdb_path=pdb_path,
-                                                                   chain_id=chain.get_id(),
-                                                                   start_residue_id=start_res_id,
-                                                                   end_residue_id=end_res_id,
-                                                                   subunit_start_sequence_id=0))
-                    if subunit_seq[-10:] in chain_seq:
-                        end_of_subunit_in_chain = chain_seq.index(subunit_seq[-10:]) + 10 - 1
-                        if subunit_seq.endswith(chain_seq[:end_of_subunit_in_chain + 1]):
-                            start_res_id = min(chain_seq_index_to_residue_id.values())
-                            end_res_id = chain_seq_index_to_residue_id[end_of_subunit_in_chain]
-                            print(f"found partial {subunit_info.name} in {pdb_filename} chain {chain.get_id()} "
-                                  f"ending at index {end_of_subunit_in_chain} "
-                                  f"{(end_res_id - start_res_id)}/{len(subunit_seq)}")
-                            subunit_start_sequence_id = len(subunit_seq) - end_of_subunit_in_chain - 1
-                            partial_subunits.append(PartialSubunit(subunit_name=subunit_info.name,
-                                                                   pdb_path=pdb_path,
-                                                                   chain_id=chain.get_id(),
-                                                                   start_residue_id=start_res_id,
-                                                                   end_residue_id=end_res_id,
-                                                                   subunit_start_sequence_id=subunit_start_sequence_id))
+                    min_match_length = 10
+                    start_ind = 0
+                    while start_ind < len(chain_seq) - min_match_length:
+                        if chain_seq[start_ind] == "X":
+                            start_ind += 1
+                            continue
+                        end_ind = start_ind + min_match_length
+                        while len(chain_seq[start_ind:end_ind].replace("X", "")) < min_match_length:
+                            end_ind += 1
+                            if end_ind >= len(chain_seq):
+                                end_ind += 1
+                                break
+                        if end_ind >= len(chain_seq):
+                            break
+
+                        if chain_seq[start_ind:end_ind] not in subunit_seq:
+                            start_ind += 1
+                            continue
+                        while end_ind < len(chain_seq) and chain_seq[start_ind:end_ind] in subunit_seq:
+                            end_ind += 1
+                        if chain_seq[start_ind:end_ind] not in subunit_seq:
+                            end_ind -= 1
+
+                        start_residue_id = start_ind + 1  # get_chain_seq function is 0-based, while res_id is 1-based
+                        end_residue_id = end_ind + 1
+
+                        subunit_start_ind = subunit_seq.index(chain_seq[start_ind:end_ind])
+                        print(f"found small partial {subunit_info.name} in {pdb_filename} chain {chain_id} "
+                              f"starting at index {start_ind} to {end_ind} (on subunit {subunit_start_ind})"
+                              f"length {(end_ind - start_ind)}/{len(subunit_seq)}")
+                        partial_subunits.append(PartialSubunit(subunit_name=subunit_info.name,
+                                                               pdb_path=pdb_path,
+                                                               chain_id=chain_id,
+                                                               start_residue_id=start_residue_id,
+                                                               end_residue_id=end_residue_id - 1,  # inclusive index
+                                                               subunit_start_sequence_id=subunit_start_ind,
+                                                               is_complete=False)
+                                                )
+                        start_ind = end_ind
 
         # print(f"found {len(partial_subunits)} partial subunits in {pdb_filename}")
         partial_subunits = sorted(partial_subunits, key=lambda x: (x.subunit_name, x.chain_id, x.start_residue_id))
@@ -249,8 +277,7 @@ def extract_representative_subunits(pdb_path_to_partial_subunits: Dict[str, List
     rep_structs: Dict[SubunitName, Tuple[float, PartialSubunit]] = {}
     for pdb_path, partial_subunits in pdb_path_to_partial_subunits.items():
         for partial_subunit in partial_subunits:
-            subunit_seq = "".join([i for i in subunits_info[partial_subunit.subunit_name].sequence if i != "X"])
-            if len(subunit_seq) != partial_subunit.end_residue_id - partial_subunit.start_residue_id + 1:
+            if not partial_subunit.is_complete:
                 continue
             subunit_residues = _get_partial_subunit_residues(partial_subunit)
             plddt_score = sum([res["CA"].get_bfactor() for res in subunit_residues]) / len(subunit_residues)
@@ -262,6 +289,7 @@ def extract_representative_subunits(pdb_path_to_partial_subunits: Dict[str, List
         print(f"rep {subunit_name} has plddt score {plddt_score}")
         subunit_info = subunits_info[subunit_name]
         rep_struct_path = os.path.join(representative_subunits_path, f"{subunit_name}.pdb")
+        print("extracting partial subunit to", partial_subunit)
         extract_partial_subunit(partial_subunit, rep_struct_path)
         copy_pdb_set_start_offset(rep_struct_path, subunit_info.start_res, rep_struct_path)
         for chain_name, ident_subunit_name in zip(subunit_info.chain_names, subunit_info.get_chained_names()):
@@ -322,6 +350,50 @@ def extract_transformations(pdb_path_to_partial_subunits: Dict[str, List[Partial
         os.remove(output_file_path)
 
 
+def run_combfold(representative_subunits_path: str, subunits_info: SubunitsInfo, transformations_path: str,
+                 crosslinks_path: Optional[str], output_path: str, output_cif: bool = False,
+                 max_results_number: int = 5, subunits_group1: Optional[List[str]] = None,):
+    # prepare and run assembly
+    with open(os.path.join(representative_subunits_path, "chain.list"), "w") as f:
+        sorted_all_subunits = sorted(sum([i.get_chained_names() for i in subunits_info.values()], []))
+        for chained_subunit_name in sorted_all_subunits:
+            if subunits_group1 is not None and chained_subunit_name in subunits_group1:
+                f.write(f"{chained_subunit_name}.pdb 1\n")
+            else:
+                f.write(f"{chained_subunit_name}.pdb\n")
+    os.chdir(representative_subunits_path)
+    if crosslinks_path is not None:
+        shutil.copy(crosslinks_path, os.path.join(representative_subunits_path, "xlink_consts.txt"))
+    else:
+        open("xlink_consts.txt", "w").close()
+
+    subprocess.run(f"{COMB_ASSEMBLY_BIN_PATH} chain.list {transformations_path}/ 900 100 xlink_consts.txt "
+                   f"-b 0.05 -t 80 > output.log 2>&1", shell=True)
+    print("--- Finished combinatorial assembly, writing output models")
+
+    # build pdbs from assembly output
+    clusters_path = os.path.join(representative_subunits_path, "output_clustered.res")
+    if not os.path.exists(clusters_path):
+        print(f"Could not assemble, exiting")
+        return
+    assembled_files = create_complexes(clusters_path, first_result=0, last_result=max_results_number,
+                                       output_folder=os.path.join(output_path, "assembled_results"),
+                                       output_cif=output_cif)
+
+    confidence = []
+    for result_as_str in open(clusters_path, "r").read().split("\n")[:len(assembled_files)]:
+        if not result_as_str.strip():
+            continue
+        splitted_result = result_as_str.split(" ")
+        confidence.append(float(splitted_result[splitted_result.index("weightedTransScore") + 1]))
+
+    with open(os.path.join(output_path, "assembled_results", "confidence.txt"), "w") as f:
+        for filename, c in zip(assembled_files, confidence):
+            f.write(f"{filename} {c}\n")
+
+    print(f"--- Assembled {len(assembled_files)} complexes, confidence: {min(confidence)}-{max(confidence)}")
+
+
 def run_on_pdbs_folder(subunits_json_path: str, pdbs_folder: str, output_path: str,
                        crosslinks_path: Optional[str] = None, output_cif: bool = True, max_results_number: int = 5):
     pdbs_folder = os.path.abspath(pdbs_folder)
@@ -357,42 +429,8 @@ def run_on_pdbs_folder(subunits_json_path: str, pdbs_folder: str, output_path: s
     print("--- Finished building unified representation")
 
     print("--- Running combinatorial assembly algorithm, may take a while")
-    # prepare and run assembly
-    with open(os.path.join(representative_subunits_path, "chain.list"), "w") as f:
-        sorted_all_subunits = sorted(sum([i.get_chained_names() for i in subunits_info.values()], []))
-        for chained_subunit_name in sorted_all_subunits:
-            f.write(f"{chained_subunit_name}.pdb\n")
-    os.chdir(representative_subunits_path)
-    if crosslinks_path is not None:
-        shutil.copy(crosslinks_path, os.path.join(representative_subunits_path, "xlink_consts.txt"))
-    else:
-        open("xlink_consts.txt", "w").close()
-
-    subprocess.run(f"{COMB_ASSEMBLY_BIN_PATH} chain.list {transformations_path}/ 900 100 xlink_consts.txt "
-                   f"-b 0.05 -t 80 > output.log 2>&1", shell=True)
-    print("--- Finished combinatorial assembly, writing output models")
-
-    # build pdbs from assembly output
-    clusters_path = os.path.join(representative_subunits_path, "output_clustered.res")
-    if not os.path.exists(clusters_path):
-        print(f"Could not assemble, exiting")
-        return
-    assembled_files = create_complexes(clusters_path, first_result=0, last_result=max_results_number,
-                                       output_folder=os.path.join(output_path, "assembled_results"),
-                                       output_cif=output_cif)
-
-    confidence = []
-    for result_as_str in open(clusters_path, "r").read().split("\n")[:len(assembled_files)]:
-        if not result_as_str.strip():
-            continue
-        splitted_result = result_as_str.split(" ")
-        confidence.append(float(splitted_result[splitted_result.index("weightedTransScore") + 1]))
-
-    with open(os.path.join(output_path, "assembled_results", "confidence.txt"), "w") as f:
-        for filename, c in zip(assembled_files, confidence):
-            f.write(f"{filename} {c}\n")
-
-    print(f"--- Assembled {len(assembled_files)} complexes, confidence: {min(confidence)}-{max(confidence)}")
+    run_combfold(representative_subunits_path, subunits_info, transformations_path, crosslinks_path, output_path,
+                 output_cif, max_results_number)
 
 
 if __name__ == '__main__':
