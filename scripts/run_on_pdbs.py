@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 from collections import defaultdict
+from functools import lru_cache
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 import scipy.spatial.distance
@@ -35,6 +36,7 @@ class PartialSubunit:
     end_residue_id: int  # inclusive
     subunit_start_sequence_id: int
     is_complete: bool = False
+    plddt: Optional[float] = None  # mean CA bfactor over the subunit range, computed at scan time
 
 
 @dataclasses.dataclass
@@ -69,6 +71,56 @@ def get_chain_to_seq(pdb_path: str, use_seqres: bool = True) -> Dict[str, str]:
     return chain_to_seq
 
 
+def _iter_pdb_ca_records(pdb_path: str):
+    """Fast single-pass scan of a PDB file yielding one record per CA atom:
+    (chain_id, res_seq, res_name, (x, y, z), bfactor).
+
+    Mirrors what Bio.PDB.PDBParser exposes for the first model (ATOM + HETATM
+    records, fixed columns), but avoids building the full Structure object --
+    parsing with Bio.PDB is the bottleneck when the PDB folder has many files.
+    """
+    n_models = 0
+    seen_endmdl = False
+    with open(pdb_path) as f:
+        for line in f:
+            if line.startswith("MODEL"):
+                n_models += 1
+                if n_models > 1:
+                    raise AssertionError(f"Too many models! {pdb_path}")
+            elif line.startswith("ENDMDL"):
+                seen_endmdl = True  # only the first model is used, like get_pdb_model_readonly
+            elif (line.startswith("ATOM") or line.startswith("HETATM")) and not seen_endmdl:
+                if line[12:16].strip() != "CA":
+                    continue
+                if line[16] not in (" ", "A"):  # skip alternate locations, like Bio.PDB
+                    continue
+                try:
+                    bfactor = float(line[60:66])
+                except ValueError:
+                    bfactor = 0.0
+                yield (line[21], int(line[22:26]), line[17:20].strip(),
+                       (float(line[30:38]), float(line[38:46]), float(line[46:54])), bfactor)
+
+
+def _scan_pdb_ca_atoms(pdb_path: str) -> Dict[str, Dict[int, Tuple[str, float]]]:
+    """One fast pass over a PDB file: chain_id -> {res_seq: (res_name, ca_bfactor)}.
+
+    Equivalent to parsing with Bio.PDB and keeping residues that have a CA atom
+    (later records overwrite earlier ones with the same residue number, matching
+    the dict comprehension in get_chain_to_seq), but much faster.
+    """
+    chains: Dict[str, Dict[int, Tuple[str, float]]] = defaultdict(dict)
+    for chain_id, res_seq, res_name, _coord, bfactor in _iter_pdb_ca_records(pdb_path):
+        chains[chain_id][res_seq] = (res_name, bfactor)
+    return dict(chains)
+
+
+def _chain_seq_from_ca_scan(res_id_to_ca: Dict[int, Tuple[str, float]]) -> str:
+    """Replicates the sequence-building logic of get_chain_to_seq(use_seqres=False)."""
+    return "".join(Bio.SeqUtils.seq1(res_id_to_ca[i][0]) if i in res_id_to_ca else "X"
+                   for i in range(1, max(res_id_to_ca) + 1))
+
+
 def _get_partial_subunit_residues(partial_subunit: PartialSubunit) -> List[Bio.PDB.Residue.Residue]:
     pdb_model = get_pdb_model_readonly(partial_subunit.pdb_path)
     return [res for res in pdb_model[partial_subunit.chain_id] if
@@ -86,9 +138,12 @@ def extract_partial_subunit(partial_subunit: PartialSubunit, output_path: str):
         if chain.id != partial_subunit.chain_id:
             model.detach_child(chain.id)
 
-    res_to_keep = _get_partial_subunit_residues(partial_subunit)
-
-    res_to_remove = [res for res in model.get_residues() if res not in res_to_keep]
+    # compute the residues to keep from the SAME parsed model. The original code re-parsed
+    # the file a second time (via get_pdb_model_readonly) and matched residues across the two
+    # parses by full_id equality in a list scan -- O(n_residues^2) full_id computations.
+    res_ids_to_keep = {res.id for res in model[partial_subunit.chain_id]
+                       if partial_subunit.start_residue_id <= res.id[1] <= partial_subunit.end_residue_id}
+    res_to_remove = [res for res in model.get_residues() if res.id not in res_ids_to_keep]
     for res in res_to_remove:
         res.parent.detach_child(res.id)
 
@@ -151,22 +206,101 @@ def score_transformation(pdb_path1: str, pdb_path2: str) -> Optional[float]:
     return sum(bfactors) / len(bfactors)
 
 
+@lru_cache(maxsize=4)
+def _read_pdb_lines_and_ca(pdb_path: str):
+    """Read a PDB file once and keep, per chain, its ATOM/HETATM lines and CA records.
+
+    Returns chain_id -> (lines, ca_records) with ca_records = (res_seq, (x, y, z), bfactor).
+    Caching the last few files avoids re-reading the same file for every pair of subunits
+    found in it (the original code re-parsed the file with Bio.PDB twice per pair).
+    """
+    chains = defaultdict(lambda: ([], []))
+    n_models = 0
+    seen_endmdl = False
+    with open(pdb_path) as f:
+        for line in f:
+            if line.startswith("MODEL"):
+                n_models += 1
+                if n_models > 1:
+                    raise AssertionError(f"Too many models! {pdb_path}")
+            elif line.startswith("ENDMDL"):
+                seen_endmdl = True
+            elif (line.startswith("ATOM") or line.startswith("HETATM")) and not seen_endmdl:
+                chain_id = line[21]
+                chains[chain_id][0].append(line)
+                if line[12:16].strip() == "CA" and line[16] in (" ", "A"):
+                    try:
+                        bfactor = float(line[60:66])
+                    except ValueError:
+                        bfactor = 0.0
+                    chains[chain_id][1].append((int(line[22:26]),
+                                                (float(line[30:38]), float(line[38:46]), float(line[46:54])),
+                                                bfactor))
+    return dict(chains)
+
+
+def _write_sample_and_get_ca(partial_subunit: PartialSubunit, output_path: str):
+    """Write the single-chain sample PDB for a partial subunit (same atom selection as
+    extract_partial_subunit: one chain, residues within [start, end]) and return its
+    CA records -- without ever building a Bio.PDB Structure."""
+    chains = _read_pdb_lines_and_ca(partial_subunit.pdb_path)
+    assert partial_subunit.chain_id in chains, f"Missing: {partial_subunit.chain_id}"
+    lines, ca_records = chains[partial_subunit.chain_id]
+    start, end = partial_subunit.start_residue_id, partial_subunit.end_residue_id
+    with open(output_path, "w") as f:
+        for line in lines:
+            if start <= int(line[22:26]) <= end:
+                f.write(line)
+        f.write("END\n")
+    return [ca for ca in ca_records if start <= ca[0] <= end]
+
+
+def _score_ca_records(ca_records1, ca_records2) -> Optional[float]:
+    """Interface pLDDT score, identical to score_transformation but computed in memory
+    (the original re-parsed the two sample PDB files it had just written)."""
+    if len(ca_records1) == 0 or len(ca_records2) == 0:
+        return None
+    chain1_ca = np.array([ca[1] for ca in ca_records1])
+    chain2_ca = np.array([ca[1] for ca in ca_records2])
+
+    close_residues = np.argwhere(scipy.spatial.distance.cdist(chain1_ca, chain2_ca) < INTERFACE_MIN_ATOM_DIST)
+    if len(close_residues) == 0:
+        return None
+
+    chain1_interface, chain2_interface = set(), set()
+    for i, j in close_residues:
+        chain1_interface.add(i)
+        chain2_interface.add(j)
+
+    bfactors = [ca_records1[i][2] for i in chain1_interface] + \
+               [ca_records2[j][2] for j in chain2_interface]
+    return sum(bfactors) / len(bfactors)
+
+
 def get_transformation_from_partials(partial_subunit1: PartialSubunit, partial_subunit2: PartialSubunit,
                                      representative_subunits_path: str, temp_folder: str,
-                                     subunits_info: SubunitsInfo) -> Optional[TransformationInfo]:
+                                     subunits_info: SubunitsInfo,
+                                     rep_partials_folder: Optional[str] = None) -> Optional[TransformationInfo]:
+    # rep partials depend only on the subunit and residue range, not on the sampled PDB --
+    # extract them once per run into a persistent folder. (The original code extracted them
+    # into temp_folder, which is wiped after every PDB file, causing a full re-extraction --
+    # two Bio.PDB parses -- for every pair of every file.)
+    rep_partials_folder = rep_partials_folder or temp_folder
     rep_struct1_path = extract_partial_from_representative(partial_subunit1, representative_subunits_path,
-                                                           temp_folder, subunits_info)
+                                                           rep_partials_folder, subunits_info)
     rep_struct2_path = extract_partial_from_representative(partial_subunit2, representative_subunits_path,
-                                                           temp_folder, subunits_info)
+                                                           rep_partials_folder, subunits_info)
 
     sample_struct1_path = os.path.join(temp_folder, f"sample1_{partial_subunit1.subunit_name}.pdb")
-    extract_partial_subunit(partial_subunit1, sample_struct1_path)
+    ca_records1 = _write_sample_and_get_ca(partial_subunit1, sample_struct1_path)
 
     sample_struct2_path = os.path.join(temp_folder, f"sample2_{partial_subunit2.subunit_name}.pdb")
-    extract_partial_subunit(partial_subunit2, sample_struct2_path)
+    ca_records2 = _write_sample_and_get_ca(partial_subunit2, sample_struct2_path)
 
-    score = score_transformation(sample_struct1_path, sample_struct2_path)
+    score = _score_ca_records(ca_records1, ca_records2)
     if score is None:
+        print("Skipping transformation, missing interface between",
+              partial_subunit1.subunit_name, partial_subunit2.subunit_name)
         return None
 
     af2trans_output = subprocess.check_output([AF2TRANS_BIN_PATH, rep_struct1_path, rep_struct2_path,
@@ -196,7 +330,10 @@ def get_pdb_to_partial_subunits(pdbs_folder: str, subunits_info: SubunitsInfo) -
         pdb_path = os.path.join(pdbs_folder, pdb_filename)
 
         partial_subunits: List[PartialSubunit] = []
-        chain_to_seq = get_chain_to_seq(pdb_path, use_seqres=False)
+        # one fast text pass per file instead of a full Bio.PDB parse
+        ca_scan = _scan_pdb_ca_atoms(pdb_path)
+        chain_to_seq = {chain_id: _chain_seq_from_ca_scan(res_id_to_ca)
+                        for chain_id, res_id_to_ca in ca_scan.items()}
         for chain_id, chain_seq in chain_to_seq.items():
             for subunit_info in subunits_info.values():
                 subunit_seq = subunit_info.sequence
@@ -204,13 +341,20 @@ def get_pdb_to_partial_subunits(pdbs_folder: str, subunits_info: SubunitsInfo) -
                     print(f"found full {subunit_info.name} in {pdb_filename} chain {chain_id}")
                     start_res_id = chain_seq.index(subunit_seq) + 1
                     end_res_id = start_res_id + len(subunit_seq) - 1
+                    # mean CA bfactor over the subunit range (used to pick the representative
+                    # subunit later, saving a second parse of every file). Same summation order
+                    # (file order) as extract_representative_subunits.
+                    ca_bfactors = [res_name_bf[1] for res_id, res_name_bf in ca_scan[chain_id].items()
+                                   if start_res_id <= res_id <= end_res_id]
+                    plddt = sum(ca_bfactors) / len(ca_bfactors)
                     partial_subunits.append(PartialSubunit(subunit_name=subunit_info.name,
                                                            pdb_path=pdb_path,
                                                            chain_id=chain_id,
                                                            start_residue_id=start_res_id,
                                                            end_residue_id=end_res_id,
                                                            subunit_start_sequence_id=0,
-                                                           is_complete=True)
+                                                           is_complete=True,
+                                                           plddt=plddt)
                                             )
                 elif chain_seq in subunit_seq:
                     start_residue_id = 1
@@ -279,8 +423,12 @@ def extract_representative_subunits(pdb_path_to_partial_subunits: Dict[str, List
         for partial_subunit in partial_subunits:
             if not partial_subunit.is_complete:
                 continue
-            subunit_residues = _get_partial_subunit_residues(partial_subunit)
-            plddt_score = sum([res["CA"].get_bfactor() for res in subunit_residues]) / len(subunit_residues)
+            if partial_subunit.plddt is not None:
+                # computed during the initial scan, no need to re-parse the file
+                plddt_score = partial_subunit.plddt
+            else:
+                subunit_residues = _get_partial_subunit_residues(partial_subunit)
+                plddt_score = sum([res["CA"].get_bfactor() for res in subunit_residues]) / len(subunit_residues)
             if rep_structs.get(partial_subunit.subunit_name, (-1, None))[0] < plddt_score:
                 rep_structs[partial_subunit.subunit_name] = (plddt_score, partial_subunit)
     assert len(rep_structs) == len(subunits_info), "missing rep subunits for" + \
@@ -301,6 +449,9 @@ def extract_representative_subunits(pdb_path_to_partial_subunits: Dict[str, List
 def extract_transformations(pdb_path_to_partial_subunits: Dict[str, List[PartialSubunit]], subunits_info: SubunitsInfo,
                             representative_subunits_path: str, transformations_path: str):
     temp_folder = os.path.join(transformations_path, "temp_transformations")
+    # persistent cache for representative-subunit partials (survives the per-file temp cleanup)
+    rep_partials_folder = os.path.join(transformations_path, "temp_rep_partials")
+    os.makedirs(rep_partials_folder, exist_ok=True)
     transformations_by_pdb_path: Dict[str, List[TransformationInfo]] = {}
     for pdb_path, partial_subunits in pdb_path_to_partial_subunits.items():
         print("- Extracting pairwise transformations from file", pdb_path)
@@ -317,10 +468,11 @@ def extract_transformations(pdb_path_to_partial_subunits: Dict[str, List[Partial
 
                 transformation_info = get_transformation_from_partials(partial_subunit1, partial_subunit2,
                                                                        representative_subunits_path, temp_folder,
-                                                                       subunits_info)
+                                                                       subunits_info, rep_partials_folder)
                 if transformation_info is not None:
                     transformations_by_pdb_path[pdb_path].append(transformation_info)
         shutil.rmtree(temp_folder)
+    shutil.rmtree(rep_partials_folder)
 
     transformations_by_subunit_pair: Dict[Tuple[str, str], List[TransformationInfo]] = defaultdict(list)
     for pdb_path, transformations in transformations_by_pdb_path.items():
